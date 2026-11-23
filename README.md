@@ -73,6 +73,34 @@ npm run dev
 | 数据集关联 | `dataset_join` | 关联方案 | 方案编号、主数据集、关联数据集 |
 | 报告生成 | `report_builder` | 报告模板 | 模板编号、报告名称、引用指标 |
 
+## 圈选条件版本
+
+群体圈选和事件匹配共用 `backend/app/segment_conditions.py` 的条件语义：
+
+| 条件版本 | 构造 | 匹配语义 |
+| --- | --- | --- |
+| `legacy_v1` | 人群旧条件原文 | 字符串包含，缺失属性按空串；旧报告人数可复算 |
+| `legacy_v1`（事件） | 事件属性原文 | 精确相等 |
+| `typed_v1` | 字段类型 + 类型化条件 | 文本必须为字符串、布尔必须为真布尔；缺失属性一律不命中 |
+
+- `vip 包含 "1"` 在旧版会选中 `"1"`、`"10"` 和整数 `1`；迁移为布尔 `true` 后
+  只选真正的布尔 `True`，字符串 `"true"`、整数 `1` 和缺失属性都不命中。
+- 新版执行（事件匹配、人群圈选）必须通过字段类型校验；缺证时保留原文本和
+  待核原因，不允许猜测字段类型。
+- 同一次正式比较的两组条件必须同版本，混版直接拒绝。旧口径继续使用时报告
+  标注 `legacy_v1`，不能当成新版结论。
+- 迁移未齐、日更到点：`legacy_fallback` 整组沿用旧口径并标注版本；
+  `require_typed` 等两群都迁完再发。
+
+相关接口（见 `backend/app/routers/segment_migration.py`）：
+
+```text
+POST /api/segment_migration/replay           旧环境回放 + 新版差异
+POST /api/segment_migration/deploy           顺序迁移，stop_after 模拟中断
+POST /api/segment_migration/daily-comparison 当天两群比较（policy 选择回退/等待）
+GET  /api/segment_migration/on-call          值班员复查报告版本和新版可发时间
+```
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

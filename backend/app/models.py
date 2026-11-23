@@ -10,6 +10,20 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
+from app.segment_conditions import (
+    ConditionCheck,
+    ConditionError,
+    ConditionExecution,
+    ConditionSet,
+    ConditionVersion,
+    FieldTypeSchema,
+    check_conditions,
+    conditions_text,
+    execute_conditions,
+    legacy_conditions_from_mapping,
+    require_same_version,
+)
+
 
 # ============================================================
 # 枚举
@@ -302,14 +316,50 @@ class EventTrack:
     attribution_key: str = ""
     period: MetricPeriod = MetricPeriod.DAILY
 
-    def matches_properties(self, conditions: dict[str, str]) -> bool:
-        """判断事件属性是否满足圈选条件（AND 逻辑）。"""
+    def typed_conditions(self) -> ConditionSet:
+        """把事件属性当作圈选条件读取，与人群圈选共用同一套类型化语义。
+
+        事件属性是历史登记的自由文本（``dict[str, str]``），旧版按精确相等解释；
+        需要新版语义时用 ``typed_conditions_from_mapping`` 配合字段类型 schema 显式构造。
+        """
+        return legacy_conditions_from_mapping(self.event_properties, match="equals")
+
+    def matches_properties(
+        self,
+        conditions: ConditionSet | dict[str, Any] | None,
+        *,
+        schema: FieldTypeSchema | None = None,
+        allow_legacy: bool = True,
+    ) -> bool:
+        """判断事件属性是否满足圈选条件（AND 逻辑）。
+
+        接受类型化条件集或旧版 ``{字段: 字符串}`` 映射；新版条件执行前会做字段类型校验，
+        缺证直接抛 ``FieldTypeMissingError``。旧版事件匹配保持精确相等语义。
+        """
+        if conditions is None:
+            return True
+        if isinstance(conditions, dict):
+            if not conditions:
+                return True
+            conditions = legacy_conditions_from_mapping(conditions, match="equals")
         if not conditions:
             return True
-        for k, v in conditions.items():
-            if k not in self.event_properties or self.event_properties[k] != v:
-                return False
-        return True
+        attrs = [self.event_properties]
+        return execute_conditions(
+            conditions, attrs, schema=schema, allow_legacy=allow_legacy
+        ).member_count == 1
+
+    def check_conditions(
+        self,
+        conditions: ConditionSet | dict[str, Any] | None,
+        schema: FieldTypeSchema,
+    ) -> ConditionCheck:
+        """只做字段类型校验，不执行匹配。"""
+        if conditions is None:
+            conditions = ConditionSet()
+        elif isinstance(conditions, dict):
+            conditions = legacy_conditions_from_mapping(conditions, match="equals")
+        return check_conditions(conditions, schema)
 
 
 # ============================================================
@@ -321,27 +371,92 @@ class Segment:
     """用户群体圈选条件：属性筛选 + 行为条件 + 指标依赖。"""
     segment_id: str
     segment_name: str
-    conditions: dict[str, str] = field(default_factory=dict)
+    conditions: dict[str, Any] = field(default_factory=dict)
     member_count: int = 0
     update_strategy: str = "daily"
     effective_range: str = ""
     bound_events: list[EventTrack] = field(default_factory=list)
     bound_metrics: list[MetricDef] = field(default_factory=list)
+    condition_version: ConditionVersion = ConditionVersion.LEGACY_V1
+    typed_conditions: ConditionSet | None = None
+    field_types: FieldTypeSchema = field(default_factory=FieldTypeSchema)
+    migration_notes: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # ``conditions`` 是旧版自由文本条件；带版本或类型化条件集的实例按新版组装。
+        self.condition_version = ConditionVersion.parse(
+            self.condition_version, ConditionVersion.LEGACY_V1
+        )
+        if self.typed_conditions is not None and not isinstance(self.typed_conditions, ConditionSet):
+            raise ConditionError("typed_conditions 必须是 ConditionSet")
+
+    @property
+    def condition_text(self) -> str:
+        """旧版原文展示；缺证字段也保留它，方便值班员复查。"""
+        if self.typed_conditions is not None:
+            return conditions_text(self.typed_conditions)
+        return " AND ".join(f"{k} 包含 {v}" for k, v in self.conditions.items())
+
+    def effective_conditions(self) -> ConditionSet:
+        """读取本次执行真正使用的条件集，并核对版本一致。"""
+        if self.typed_conditions is not None:
+            if self.typed_conditions.version != self.condition_version:
+                raise ConditionError(
+                    f"人群 {self.segment_id} 的条件集版本 {self.typed_conditions.version.value} "
+                    f"与人群版本 {self.condition_version.value} 不一致"
+                )
+            return self.typed_conditions
+        if self.condition_version == ConditionVersion.TYPED_V1:
+            raise ConditionError(
+                f"人群 {self.segment_id} 标为 typed_v1，但没有类型化条件集"
+            )
+        return legacy_conditions_from_mapping(self.conditions)
+
+    def check(self, schema: FieldTypeSchema | None = None) -> ConditionCheck:
+        """执行前的字段类型校验：旧条件允许缺证，新版条件缺证即阻断。"""
+        conditions = self.effective_conditions()
+        merged = self.field_types.merge(schema) if schema else self.field_types
+        return check_conditions(conditions, merged, self.condition_version)
+
+    def execute(
+        self,
+        users: list[dict[str, Any]],
+        *,
+        schema: FieldTypeSchema | None = None,
+        allow_legacy: bool = True,
+    ) -> ConditionExecution:
+        """按人群自身的版本圈选成员，并记录成员数和执行的版本。"""
+        conditions = self.effective_conditions()
+        merged = self.field_types.merge(schema) if schema else self.field_types
+        execution = execute_conditions(
+            conditions, users, schema=merged, allow_legacy=allow_legacy
+        )
+        self.member_count = execution.member_count
+        return execution
 
     def select_users(self, users: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """根据圈选条件从用户列表中筛选目标群体。"""
-        result = []
-        for user in users:
-            match = True
-            for cond_key, cond_val in self.conditions.items():
-                user_val = str(user.get(cond_key, ""))
-                if cond_val not in user_val:
-                    match = False
-                    break
-            if match:
-                result.append(user)
-        self.member_count = len(result)
-        return result
+        """根据圈选条件从用户列表中筛选目标群体（默认按人群版本执行）。"""
+        return self.execute(users).matched
+
+    def with_typed_conditions(
+        self,
+        typed: ConditionSet,
+        *,
+        schema: FieldTypeSchema | None = None,
+        notes: list[dict[str, Any]] | None = None,
+    ) -> "Segment":
+        """迁移完成后的新版人群：原旧条件原文保留在 ``conditions`` 里。"""
+        if typed.version != ConditionVersion.TYPED_V1:
+            raise ConditionError("with_typed_conditions 只接受 typed_v1 条件集")
+        check = check_conditions(typed, schema or self.field_types)
+        check.require_executable()
+        self.condition_version = ConditionVersion.TYPED_V1
+        self.typed_conditions = typed
+        if schema is not None:
+            self.field_types = schema
+        if notes is not None:
+            self.migration_notes = list(notes)
+        return self
 
 
 # ============================================================
@@ -357,6 +472,52 @@ class UserSegmentCompare:
     compare_metric: MetricDef
     data_a: list[float] = field(default_factory=list)
     data_b: list[float] = field(default_factory=list)
+
+    def version(self) -> ConditionVersion:
+        """一次正式比较只能取一个版本，两组人群混版直接拒绝。"""
+        return require_same_version(
+            self.segment_a.condition_version, self.segment_b.condition_version
+        )
+
+    def recompute(
+        self,
+        users: list[dict[str, Any]],
+        *,
+        schema: FieldTypeSchema | None = None,
+        allow_legacy: bool = True,
+    ) -> dict[str, Any]:
+        """用两组条件对实际成员重新执行圈选，返回成员与版本证据。
+
+        报告只使用这里圈出来的成员，不再依赖调用方事先塞进来的计数值。
+        """
+        version = self.version()
+        exec_a = self.segment_a.execute(users, schema=schema, allow_legacy=allow_legacy)
+        exec_b = self.segment_b.execute(users, schema=schema, allow_legacy=allow_legacy)
+        return {
+            "version": version.value,
+            "segment_a": {
+                "segment_id": self.segment_a.segment_id,
+                "segment_name": self.segment_a.segment_name,
+                "member_count": exec_a.member_count,
+                "member_ids": [_member_key(u) for u in exec_a.matched],
+                "conditions_text": self.segment_a.condition_text,
+                "conditions": self.segment_a.effective_conditions().describe(),
+                "field_type_check": exec_a.check.describe() if exec_a.check else None,
+                "migration_notes": list(self.segment_a.migration_notes),
+            },
+            "segment_b": {
+                "segment_id": self.segment_b.segment_id,
+                "segment_name": self.segment_b.segment_name,
+                "member_count": exec_b.member_count,
+                "member_ids": [_member_key(u) for u in exec_b.matched],
+                "conditions_text": self.segment_b.condition_text,
+                "conditions": self.segment_b.effective_conditions().describe(),
+                "field_type_check": exec_b.check.describe() if exec_b.check else None,
+                "migration_notes": list(self.segment_b.migration_notes),
+            },
+            "_matched_a": exec_a.matched,
+            "_matched_b": exec_b.matched,
+        }
 
     def compute_ttest(self) -> dict[str, Any]:
         """Welch's t-test 计算两组均值的统计显著性。"""
@@ -393,6 +554,72 @@ class UserSegmentCompare:
             "n_a": n_a,
             "n_b": n_b,
         }
+
+    def generate_report(
+        self,
+        users: list[dict[str, Any]],
+        *,
+        schema: FieldTypeSchema | None = None,
+        allow_legacy: bool = True,
+        metric_field: str | None = None,
+    ) -> dict[str, Any]:
+        """用实际圈中成员生成人群比较报告。
+
+        旧口径继续使用时报告必须标注 ``legacy_v1``，不能当成新版结论；
+        两组条件版本不一致时直接拒绝出具报告。
+        """
+        selection = self.recompute(users, schema=schema, allow_legacy=allow_legacy)
+        version = ConditionVersion(selection["version"])
+        field = metric_field or self.compare_metric.field_name
+        data_a = _numeric_values(selection["_matched_a"], field)
+        data_b = _numeric_values(selection["_matched_b"], field)
+        self.data_a, self.data_b = data_a, data_b
+        test = self.compute_ttest()
+        report = {
+            "compare_id": self.compare_id,
+            "metric_name": self.compare_metric.metric_name,
+            "metric_field": field,
+            "version": version.value,
+            "version_label": (
+                "旧口径 legacy_v1（继续沿用，不等同新版结论）"
+                if version == ConditionVersion.LEGACY_V1
+                else "新版 typed_v1"
+            ),
+            "segment_a": selection["segment_a"],
+            "segment_b": selection["segment_b"],
+            "test": test,
+            "diff": (
+                round(test["mean_a"] - test["mean_b"], 4)
+                if "mean_a" in test else None
+            ),
+            "recomputable": True,
+        }
+        if version == ConditionVersion.LEGACY_V1:
+            report["legacy_conditions"] = {
+                "segment_a": self.segment_a.condition_text,
+                "segment_b": self.segment_b.condition_text,
+            }
+        return report
+
+
+def _member_key(user: dict[str, Any]) -> str:
+    for key in ("user_id", "id", "member_id"):
+        if key in user:
+            return str(user[key])
+    return str(user)
+
+
+def _numeric_values(users: list[dict[str, Any]], field_name: str) -> list[float]:
+    values: list[float] = []
+    for user in users:
+        value = user.get(field_name)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return values
 
 
 # ============================================================

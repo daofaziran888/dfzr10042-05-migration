@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.segment_conditions import ConditionVersion, FieldTypeSchema
 from app.models import (
     ABExperiment,
     AggregationMethod,
@@ -190,37 +191,53 @@ def pipeline_dimension_drill(
 def pipeline_event_to_segment(
     events: list[EventTrack],
     users: list[dict[str, Any]],
+    *,
+    event_schemas: dict[str, FieldTypeSchema] | None = None,
+    version: ConditionVersion | str | None = None,
+    allow_legacy: bool = True,
 ) -> dict[str, Any]:
     """事件追踪到分群比较的完整管道。
 
-    1. 从事件定义构建群体圈选条件
-    2. 圈选目标用户群体
-    3. 执行跨群体比较
+    1. 从事件定义构建群体圈选条件（优先使用事件已迁移的类型化条件）
+    2. 圈选目标用户群体（新版条件执行前必须过字段类型校验）
+    3. 用实际圈中的成员执行跨群体比较
+
+    ``version`` 显式指定时整条管道只用该版本；两组条件混版会直接拒绝。
     """
     segments = []
     comparisons = []
+    details: list[tuple[Segment, list[dict[str, Any]]]] = []
 
     for event in events:
-        # 构建群体圈选
+        # 构建群体圈选：同一事件既可持有旧版原文，也可持有已迁移的类型化条件。
         segment = Segment(
             segment_id=f"SEG_{event.event_id}",
             segment_name=f"群体_{event.event_name}",
-            conditions=event.event_properties,
+            conditions=dict(event.event_properties),
             bound_events=[event],
         )
-
-        selected_users = segment.select_users(users)
+        if version is not None:
+            segment.condition_version = ConditionVersion.parse(version, ConditionVersion.TYPED_V1)
+        event_schema = (event_schemas or {}).get(event.event_id)
+        if event_schema is not None:
+            segment.field_types = segment.field_types.merge(event_schema)
+        execution = segment.execute(users, allow_legacy=allow_legacy)
+        selected_users = execution.matched
         segments.append({
             "segment_id": segment.segment_id,
             "segment_name": segment.segment_name,
             "member_count": segment.member_count,
-            "conditions_count": len(segment.conditions),
+            "conditions_count": len(segment.effective_conditions()),
             "sample_users": selected_users[:3],
+            "version": execution.version.value,
+            "member_ids": [str(u.get("user_id", u.get("id", ""))) for u in selected_users],
+            "field_type_check": execution.check.describe() if execution.check else None,
         })
+        details.append((segment, selected_users))
 
-    # 执行跨群体比较（两两比较）
-    for i, seg_a in enumerate(segments):
-        for j, seg_b in enumerate(segments):
+    # 执行跨群体比较（两两比较），只使用实际圈中的成员
+    for i, (seg_a, members_a) in enumerate(details):
+        for j, (seg_b, members_b) in enumerate(details):
             if i >= j:
                 continue
             metric = MetricDef(
@@ -234,12 +251,21 @@ def pipeline_event_to_segment(
                 field_name="conversion_rate",
                 table_name="user_events",
             )
+            compare = UserSegmentCompare(
+                compare_id=f"CMP_{seg_a.segment_id}_{seg_b.segment_id}",
+                segment_a=seg_a,
+                segment_b=seg_b,
+                compare_metric=metric,
+            )
             comparison = {
-                "segment_a": seg_a["segment_name"],
-                "segment_b": seg_b["segment_name"],
-                "count_a": seg_a["member_count"],
-                "count_b": seg_b["member_count"],
+                "segment_a": seg_a.segment_name,
+                "segment_b": seg_b.segment_name,
+                "count_a": len(members_a),
+                "count_b": len(members_b),
                 "metric": metric.metric_name,
+                "version": compare.version().value,
+                "member_ids_a": [str(u.get("user_id", u.get("id", ""))) for u in members_a],
+                "member_ids_b": [str(u.get("user_id", u.get("id", ""))) for u in members_b],
             }
             comparisons.append(comparison)
 
